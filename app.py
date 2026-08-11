@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
+import time
 
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,6 +35,10 @@ PAGESPEED_API_URL = (
 
 REQUEST_TIMEOUT = 120
 
+MAX_ATTEMPTS = 3
+
+URL_WORKERS = 2
+
 
 # =========================================================
 # API KEY
@@ -50,10 +55,21 @@ except Exception:
 
 
 # =========================================================
-# PSI REQUEST
+# PSI REQUEST WITH RETRY
 # =========================================================
 
 def get_pagespeed_data(url, strategy):
+    """
+    Runs PageSpeed Insights API.
+
+    Automatically retries:
+    - timeouts
+    - 429
+    - 500
+    - 502
+    - 503
+    - 504
+    """
 
     params = {
         "url": url,
@@ -62,18 +78,114 @@ def get_pagespeed_data(url, strategy):
         "category": "performance"
     }
 
-    response = requests.get(
-        PAGESPEED_API_URL,
-        params=params,
-        timeout=REQUEST_TIMEOUT
-    )
+    retry_status_codes = {
+        429,
+        500,
+        502,
+        503,
+        504
+    }
 
-    if response.status_code != 200:
-        raise Exception(
-            f"API error {response.status_code}: {response.text}"
-        )
+    last_error = None
 
-    return response.json()
+    for attempt in range(
+        1,
+        MAX_ATTEMPTS + 1
+    ):
+
+        try:
+
+            response = requests.get(
+                PAGESPEED_API_URL,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            # SUCCESS
+            if response.status_code == 200:
+                return {
+                    "success": True,
+                    "data": response.json(),
+                    "attempts": attempt,
+                    "error": ""
+                }
+
+            # RETRYABLE API ERROR
+            if (
+                response.status_code
+                in retry_status_codes
+            ):
+
+                last_error = (
+                    f"API error "
+                    f"{response.status_code}"
+                )
+
+                if attempt < MAX_ATTEMPTS:
+
+                    wait_seconds = (
+                        2 ** attempt
+                    )
+
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                    continue
+
+            # NON-RETRYABLE API ERROR
+            return {
+                "success": False,
+                "data": None,
+                "attempts": attempt,
+                "error": (
+                    f"API error "
+                    f"{response.status_code}: "
+                    f"{response.text}"
+                )
+            }
+
+        except requests.exceptions.Timeout:
+
+            last_error = (
+                f"Timeout after "
+                f"{REQUEST_TIMEOUT}s"
+            )
+
+            if attempt < MAX_ATTEMPTS:
+
+                wait_seconds = (
+                    2 ** attempt
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+        except requests.exceptions.RequestException as e:
+
+            last_error = str(e)
+
+            if attempt < MAX_ATTEMPTS:
+
+                wait_seconds = (
+                    2 ** attempt
+                )
+
+                time.sleep(
+                    wait_seconds
+                )
+
+                continue
+
+    return {
+        "success": False,
+        "data": None,
+        "attempts": MAX_ATTEMPTS,
+        "error": last_error or "Unknown error"
+    }
 
 
 # =========================================================
@@ -94,7 +206,9 @@ def extract_performance_score(data):
         if score is None:
             return None
 
-        return round(score * 100)
+        return round(
+            score * 100
+        )
 
     except Exception:
         return None
@@ -111,7 +225,8 @@ def extract_mobile_cwv(data):
         {}
     )
 
-    # Do not use origin fallback as page-level data
+    # Do not use origin fallback
+    # as page-level CWV data
     if loading_experience.get(
         "origin_fallback",
         False
@@ -144,10 +259,12 @@ def extract_mobile_cwv(data):
         )
 
         if lcp_ms is not None:
+
             lcp = round(
                 lcp_ms / 1000,
                 2
             )
+
         else:
             lcp = None
 
@@ -163,9 +280,11 @@ def extract_mobile_cwv(data):
     )
 
     if inp_metric:
+
         inp = inp_metric.get(
             "percentile"
         )
+
     else:
         inp = None
 
@@ -184,10 +303,12 @@ def extract_mobile_cwv(data):
         )
 
         if cls_raw is not None:
+
             cls = round(
                 cls_raw / 100,
                 3
             )
+
         else:
             cls = None
 
@@ -199,8 +320,11 @@ def extract_mobile_cwv(data):
         and inp is None
         and cls is None
     ):
+
         cwv_data = "N/A"
+
     else:
+
         cwv_data = "URL"
 
     return {
@@ -215,7 +339,10 @@ def extract_mobile_cwv(data):
 # FORMAT VALUES
 # =========================================================
 
-def format_value(value, suffix=""):
+def format_value(
+    value,
+    suffix=""
+):
 
     if value is None:
         return "N/A"
@@ -224,99 +351,249 @@ def format_value(value, suffix=""):
 
 
 # =========================================================
-# ANALYZE ONE URL
+# ANALYZE MOBILE
 # =========================================================
 
-def analyze_single_url(url):
+def analyze_mobile(url):
+
+    response = get_pagespeed_data(
+        url,
+        "mobile"
+    )
 
     result = {
-        "URL": url,
-        "PageSpeed Mobile": "Error",
-        "PageSpeed Desktop": "Error",
-        "LCP Mobile": "N/A",
-        "INP Mobile": "N/A",
-        "CLS Mobile": "N/A",
-        "CWV Data": "N/A",
-        "Tested At": datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        ),
-        "Error": ""
+        "score": "Error",
+        "lcp": "N/A",
+        "inp": "N/A",
+        "cls": "N/A",
+        "cwv_data": "N/A",
+        "status": "ERROR",
+        "attempts": response[
+            "attempts"
+        ],
+        "error": response[
+            "error"
+        ]
     }
 
-    try:
+    if not response[
+        "success"
+    ]:
+        return result
 
-        # Mobile + desktop are run simultaneously
-        with ThreadPoolExecutor(
-            max_workers=2
-        ) as executor:
+    data = response[
+        "data"
+    ]
 
-            mobile_future = executor.submit(
-                get_pagespeed_data,
-                url,
-                "mobile"
-            )
-
-            desktop_future = executor.submit(
-                get_pagespeed_data,
-                url,
-                "desktop"
-            )
-
-            mobile_data = mobile_future.result()
-            desktop_data = desktop_future.result()
-
-        # Mobile Lighthouse
-        mobile_score = extract_performance_score(
-            mobile_data
+    score = (
+        extract_performance_score(
+            data
         )
+    )
 
-        if mobile_score is not None:
-            result[
-                "PageSpeed Mobile"
-            ] = mobile_score
+    if score is not None:
 
-        # Desktop Lighthouse
-        desktop_score = extract_performance_score(
-            desktop_data
-        )
+        result[
+            "score"
+        ] = score
 
-        if desktop_score is not None:
-            result[
-                "PageSpeed Desktop"
-            ] = desktop_score
+    cwv = extract_mobile_cwv(
+        data
+    )
 
-        # Mobile CWV
-        cwv = extract_mobile_cwv(
-            mobile_data
-        )
+    result[
+        "lcp"
+    ] = format_value(
+        cwv["LCP"],
+        " s"
+    )
 
-        result["LCP Mobile"] = format_value(
-            cwv["LCP"],
-            " s"
-        )
+    result[
+        "inp"
+    ] = format_value(
+        cwv["INP"],
+        " ms"
+    )
 
-        result["INP Mobile"] = format_value(
-            cwv["INP"],
-            " ms"
-        )
+    result[
+        "cls"
+    ] = format_value(
+        cwv["CLS"]
+    )
 
-        result["CLS Mobile"] = format_value(
-            cwv["CLS"]
-        )
+    result[
+        "cwv_data"
+    ] = cwv[
+        "CWV Data"
+    ]
 
-        result["CWV Data"] = cwv[
-            "CWV Data"
-        ]
+    result[
+        "status"
+    ] = (
+        "OK"
+        if response["attempts"] == 1
+        else "RETRIED"
+    )
 
-    except Exception as e:
-
-        result["Error"] = str(e)
+    result[
+        "error"
+    ] = ""
 
     return result
 
 
 # =========================================================
-# STREAMLIT CELL COLORS
+# ANALYZE DESKTOP
+# =========================================================
+
+def analyze_desktop(url):
+
+    response = get_pagespeed_data(
+        url,
+        "desktop"
+    )
+
+    result = {
+        "score": "Error",
+        "status": "ERROR",
+        "attempts": response[
+            "attempts"
+        ],
+        "error": response[
+            "error"
+        ]
+    }
+
+    if not response[
+        "success"
+    ]:
+        return result
+
+    score = (
+        extract_performance_score(
+            response["data"]
+        )
+    )
+
+    if score is not None:
+
+        result[
+            "score"
+        ] = score
+
+    result[
+        "status"
+    ] = (
+        "OK"
+        if response["attempts"] == 1
+        else "RETRIED"
+    )
+
+    result[
+        "error"
+    ] = ""
+
+    return result
+
+
+# =========================================================
+# ANALYZE ONE URL
+# =========================================================
+
+def analyze_single_url(url):
+
+    # Mobile and desktop are still
+    # run simultaneously for each URL.
+    with ThreadPoolExecutor(
+        max_workers=2
+    ) as executor:
+
+        mobile_future = (
+            executor.submit(
+                analyze_mobile,
+                url
+            )
+        )
+
+        desktop_future = (
+            executor.submit(
+                analyze_desktop,
+                url
+            )
+        )
+
+        mobile = (
+            mobile_future.result()
+        )
+
+        desktop = (
+            desktop_future.result()
+        )
+
+    error_messages = []
+
+    if mobile["error"]:
+
+        error_messages.append(
+            "Mobile: "
+            + mobile["error"]
+        )
+
+    if desktop["error"]:
+
+        error_messages.append(
+            "Desktop: "
+            + desktop["error"]
+        )
+
+    return {
+        "URL":
+            url,
+
+        "PageSpeed Mobile":
+            mobile["score"],
+
+        "PageSpeed Desktop":
+            desktop["score"],
+
+        "LCP Mobile":
+            mobile["lcp"],
+
+        "INP Mobile":
+            mobile["inp"],
+
+        "CLS Mobile":
+            mobile["cls"],
+
+        "CWV Data":
+            mobile["cwv_data"],
+
+        "Mobile Fetch":
+            mobile["status"],
+
+        "Desktop Fetch":
+            desktop["status"],
+
+        "Mobile Attempts":
+            mobile["attempts"],
+
+        "Desktop Attempts":
+            desktop["attempts"],
+
+        "Tested At":
+            datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+
+        "Error":
+            " | ".join(
+                error_messages
+            )
+    }
+
+
+# =========================================================
+# COLORS
 # =========================================================
 
 GREEN_BG = "#d9ead3"
@@ -368,7 +645,7 @@ def gray_style():
 
 
 # =========================================================
-# PAGESPEED COLOR
+# COLOR PAGESPEED
 # =========================================================
 
 def color_pagespeed(value):
@@ -382,28 +659,30 @@ def color_pagespeed(value):
         return gray_style()
 
     try:
-        value = float(value)
+
+        numeric = float(
+            value
+        )
 
     except Exception:
+
         return gray_style()
 
-    # Google Lighthouse:
-    # 90–100 = Good
-    # 50–89 = Needs Improvement
-    # 0–49 = Poor
+    if numeric >= 90:
 
-    if value >= 90:
         return green_style()
 
-    elif value >= 50:
+    elif numeric >= 50:
+
         return orange_style()
 
     else:
+
         return red_style()
 
 
 # =========================================================
-# LCP COLOR
+# COLOR LCP
 # =========================================================
 
 def color_lcp(value):
@@ -413,31 +692,39 @@ def color_lcp(value):
         None,
         ""
     ]:
+
         return gray_style()
 
     try:
 
-        value = float(
+        numeric = float(
             str(value)
-            .replace(" s", "")
+            .replace(
+                " s",
+                ""
+            )
             .strip()
         )
 
     except Exception:
+
         return gray_style()
 
-    if value <= 2.5:
+    if numeric <= 2.5:
+
         return green_style()
 
-    elif value <= 4.0:
+    elif numeric <= 4.0:
+
         return orange_style()
 
     else:
+
         return red_style()
 
 
 # =========================================================
-# INP COLOR
+# COLOR INP
 # =========================================================
 
 def color_inp(value):
@@ -447,31 +734,39 @@ def color_inp(value):
         None,
         ""
     ]:
+
         return gray_style()
 
     try:
 
-        value = float(
+        numeric = float(
             str(value)
-            .replace(" ms", "")
+            .replace(
+                " ms",
+                ""
+            )
             .strip()
         )
 
     except Exception:
+
         return gray_style()
 
-    if value <= 200:
+    if numeric <= 200:
+
         return green_style()
 
-    elif value <= 500:
+    elif numeric <= 500:
+
         return orange_style()
 
     else:
+
         return red_style()
 
 
 # =========================================================
-# CLS COLOR
+# COLOR CLS
 # =========================================================
 
 def color_cls(value):
@@ -481,26 +776,34 @@ def color_cls(value):
         None,
         ""
     ]:
+
         return gray_style()
 
     try:
-        value = float(value)
+
+        numeric = float(
+            value
+        )
 
     except Exception:
+
         return gray_style()
 
-    if value <= 0.1:
+    if numeric <= 0.1:
+
         return green_style()
 
-    elif value <= 0.25:
+    elif numeric <= 0.25:
+
         return orange_style()
 
     else:
+
         return red_style()
 
 
 # =========================================================
-# EXCEL EXPORT WITH COLORS
+# EXCEL EXPORT
 # =========================================================
 
 def create_excel_file(df):
@@ -518,59 +821,77 @@ def create_excel_file(df):
             index=False
         )
 
-        workbook = writer.book
+        workbook = (
+            writer.book
+        )
 
-        worksheet = writer.sheets[
-            "PageSpeed Results"
-        ]
+        worksheet = (
+            writer.sheets[
+                "PageSpeed Results"
+            ]
+        )
 
         # -------------------------------------------------
         # FORMATS
         # -------------------------------------------------
 
-        header_format = workbook.add_format({
-            "bold": True,
-            "bg_color": "#D9EAF7",
-            "border": 1,
-            "align": "center",
-            "valign": "vcenter"
-        })
+        header_format = (
+            workbook.add_format({
+                "bold": True,
+                "bg_color": "#D9EAF7",
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter"
+            })
+        )
 
-        green_format = workbook.add_format({
-            "bg_color": GREEN_BG,
-            "font_color": GREEN_TEXT,
-            "bold": True,
-            "border": 1
-        })
+        green_format = (
+            workbook.add_format({
+                "bg_color": GREEN_BG,
+                "font_color": GREEN_TEXT,
+                "bold": True,
+                "border": 1
+            })
+        )
 
-        orange_format = workbook.add_format({
-            "bg_color": ORANGE_BG,
-            "font_color": ORANGE_TEXT,
-            "bold": True,
-            "border": 1
-        })
+        orange_format = (
+            workbook.add_format({
+                "bg_color": ORANGE_BG,
+                "font_color": ORANGE_TEXT,
+                "bold": True,
+                "border": 1
+            })
+        )
 
-        red_format = workbook.add_format({
-            "bg_color": RED_BG,
-            "font_color": RED_TEXT,
-            "bold": True,
-            "border": 1
-        })
+        red_format = (
+            workbook.add_format({
+                "bg_color": RED_BG,
+                "font_color": RED_TEXT,
+                "bold": True,
+                "border": 1
+            })
+        )
 
-        gray_format = workbook.add_format({
-            "bg_color": GRAY_BG,
-            "font_color": GRAY_TEXT,
-            "border": 1
-        })
+        gray_format = (
+            workbook.add_format({
+                "bg_color": GRAY_BG,
+                "font_color": GRAY_TEXT,
+                "border": 1
+            })
+        )
 
-        normal_format = workbook.add_format({
-            "border": 1
-        })
+        normal_format = (
+            workbook.add_format({
+                "border": 1
+            })
+        )
 
-        url_format = workbook.add_format({
-            "border": 1,
-            "text_wrap": True
-        })
+        url_format = (
+            workbook.add_format({
+                "border": 1,
+                "text_wrap": True
+            })
+        )
 
         # -------------------------------------------------
         # HEADERS
@@ -588,37 +909,19 @@ def create_excel_file(df):
             )
 
         # -------------------------------------------------
-        # COLUMN WIDTHS
+        # WIDTHS
         # -------------------------------------------------
 
         worksheet.set_column(
-            "A:A",
+            0,
+            0,
             60
         )
 
         worksheet.set_column(
-            "B:C",
-            20
-        )
-
-        worksheet.set_column(
-            "D:F",
-            16
-        )
-
-        worksheet.set_column(
-            "G:G",
-            12
-        )
-
-        worksheet.set_column(
-            "H:H",
-            22
-        )
-
-        worksheet.set_column(
-            "I:I",
-            50
+            1,
+            len(df.columns) - 1,
+            18
         )
 
         worksheet.freeze_panes(
@@ -627,32 +930,32 @@ def create_excel_file(df):
         )
 
         # -------------------------------------------------
-        # DATA CELLS
+        # DATA
         # -------------------------------------------------
 
         for row_index, row in df.iterrows():
 
-            excel_row = row_index + 1
+            excel_row = (
+                row_index + 1
+            )
 
             for col_index, column in enumerate(
                 df.columns
             ):
 
-                value = row[column]
+                value = row[
+                    column
+                ]
 
-                cell_format = normal_format
-
-                # -----------------------------------------
-                # URL
-                # -----------------------------------------
+                cell_format = (
+                    normal_format
+                )
 
                 if column == "URL":
 
-                    cell_format = url_format
-
-                # -----------------------------------------
-                # PAGESPEED
-                # -----------------------------------------
+                    cell_format = (
+                        url_format
+                    )
 
                 elif column in [
                     "PageSpeed Mobile",
@@ -661,23 +964,33 @@ def create_excel_file(df):
 
                     try:
 
-                        numeric = float(value)
+                        numeric = float(
+                            value
+                        )
 
                         if numeric >= 90:
-                            cell_format = green_format
+
+                            cell_format = (
+                                green_format
+                            )
 
                         elif numeric >= 50:
-                            cell_format = orange_format
+
+                            cell_format = (
+                                orange_format
+                            )
 
                         else:
-                            cell_format = red_format
+
+                            cell_format = (
+                                red_format
+                            )
 
                     except Exception:
-                        cell_format = gray_format
 
-                # -----------------------------------------
-                # LCP
-                # -----------------------------------------
+                        cell_format = (
+                            gray_format
+                        )
 
                 elif column == "LCP Mobile":
 
@@ -692,20 +1005,28 @@ def create_excel_file(df):
                         )
 
                         if numeric <= 2.5:
-                            cell_format = green_format
+
+                            cell_format = (
+                                green_format
+                            )
 
                         elif numeric <= 4.0:
-                            cell_format = orange_format
+
+                            cell_format = (
+                                orange_format
+                            )
 
                         else:
-                            cell_format = red_format
+
+                            cell_format = (
+                                red_format
+                            )
 
                     except Exception:
-                        cell_format = gray_format
 
-                # -----------------------------------------
-                # INP
-                # -----------------------------------------
+                        cell_format = (
+                            gray_format
+                        )
 
                 elif column == "INP Mobile":
 
@@ -720,20 +1041,28 @@ def create_excel_file(df):
                         )
 
                         if numeric <= 200:
-                            cell_format = green_format
+
+                            cell_format = (
+                                green_format
+                            )
 
                         elif numeric <= 500:
-                            cell_format = orange_format
+
+                            cell_format = (
+                                orange_format
+                            )
 
                         else:
-                            cell_format = red_format
+
+                            cell_format = (
+                                red_format
+                            )
 
                     except Exception:
-                        cell_format = gray_format
 
-                # -----------------------------------------
-                # CLS
-                # -----------------------------------------
+                        cell_format = (
+                            gray_format
+                        )
 
                 elif column == "CLS Mobile":
 
@@ -744,16 +1073,28 @@ def create_excel_file(df):
                         )
 
                         if numeric <= 0.1:
-                            cell_format = green_format
+
+                            cell_format = (
+                                green_format
+                            )
 
                         elif numeric <= 0.25:
-                            cell_format = orange_format
+
+                            cell_format = (
+                                orange_format
+                            )
 
                         else:
-                            cell_format = red_format
+
+                            cell_format = (
+                                red_format
+                            )
 
                     except Exception:
-                        cell_format = gray_format
+
+                        cell_format = (
+                            gray_format
+                        )
 
                 worksheet.write(
                     excel_row,
@@ -797,10 +1138,10 @@ if st.button(
         if url.strip()
     ]
 
-    # Remove exact duplicates
-    # but keep original order
     urls = list(
-        dict.fromkeys(urls)
+        dict.fromkeys(
+            urls
+        )
     )
 
     if not urls:
@@ -813,20 +1154,26 @@ if st.button(
 
     results = []
 
-    progress = st.progress(0)
+    progress = st.progress(
+        0
+    )
 
-    status_text = st.empty()
+    status_text = (
+        st.empty()
+    )
 
-    total_urls = len(urls)
+    total_urls = len(
+        urls
+    )
 
     completed = 0
 
     # =====================================================
-    # PARALLEL URL ANALYSIS
+    # PARALLEL URLs
     # =====================================================
 
     with ThreadPoolExecutor(
-        max_workers=3
+        max_workers=URL_WORKERS
     ) as executor:
 
         futures = {
@@ -848,22 +1195,54 @@ if st.button(
 
             try:
 
-                result = future.result()
+                result = (
+                    future.result()
+                )
 
             except Exception as e:
 
                 result = {
-                    "URL": url,
-                    "PageSpeed Mobile": "Error",
-                    "PageSpeed Desktop": "Error",
-                    "LCP Mobile": "N/A",
-                    "INP Mobile": "N/A",
-                    "CLS Mobile": "N/A",
-                    "CWV Data": "N/A",
-                    "Tested At": datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    "Error": str(e)
+                    "URL":
+                        url,
+
+                    "PageSpeed Mobile":
+                        "Error",
+
+                    "PageSpeed Desktop":
+                        "Error",
+
+                    "LCP Mobile":
+                        "N/A",
+
+                    "INP Mobile":
+                        "N/A",
+
+                    "CLS Mobile":
+                        "N/A",
+
+                    "CWV Data":
+                        "N/A",
+
+                    "Mobile Fetch":
+                        "ERROR",
+
+                    "Desktop Fetch":
+                        "ERROR",
+
+                    "Mobile Attempts":
+                        0,
+
+                    "Desktop Attempts":
+                        0,
+
+                    "Tested At":
+                        datetime.now()
+                        .strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+
+                    "Error":
+                        str(e)
                 }
 
             results.append(
@@ -892,7 +1271,9 @@ if st.button(
     order_map = {
         url: index
         for index, url
-        in enumerate(urls)
+        in enumerate(
+            urls
+        )
     }
 
     results.sort(
@@ -966,17 +1347,23 @@ if st.button(
     )
 
     # =====================================================
-    # EXCEL DOWNLOAD WITH COLORS
+    # EXCEL
     # =====================================================
 
-    excel_file = create_excel_file(
-        df
+    excel_file = (
+        create_excel_file(
+            df
+        )
     )
 
     st.download_button(
-        label="Download Excel with Colors",
+        label=(
+            "Download Excel with Colors"
+        ),
         data=excel_file,
-        file_name="pagespeed_results.xlsx",
+        file_name=(
+            "pagespeed_results.xlsx"
+        ),
         mime=(
             "application/"
             "vnd.openxmlformats-officedocument."
@@ -985,7 +1372,7 @@ if st.button(
     )
 
     # =====================================================
-    # CSV DOWNLOAD
+    # CSV
     # =====================================================
 
     csv = (
@@ -1000,6 +1387,8 @@ if st.button(
     st.download_button(
         label="Download CSV",
         data=csv,
-        file_name="pagespeed_results.csv",
+        file_name=(
+            "pagespeed_results.csv"
+        ),
         mime="text/csv"
     )
